@@ -1,0 +1,62 @@
+# =====================================================================
+# Duplex sequencing pipeline — configuration template
+# =====================================================================
+# Edit the paths below for your environment, then run:
+#
+#   snakemake --use-conda --conda-frontend conda --cores 16
+#
+# =====================================================================
+
+# --- Sample sheet ---
+samples_tsv: "config/samples.tsv"
+
+# --- Output directory ---
+# Keep this OUTSIDE the pipeline folder so the repo stays clean.
+results_dir: "/path/to/your/results/directory"    # <-- CHANGE THIS
+
+# --- Run name ---
+run_name: "my_run"
+
+# --- Reference genome ---
+# Must have .fai, .dict, and BWA index files alongside it.
+# hg38 recommended. Build indices with: bwa index hg38.fa && samtools faidx hg38.fa
+reference:
+  fasta: "/path/to/hg38.fa"                        # <-- CHANGE THIS
+
+# --- Panel / target regions ---
+# BED file defining the genomic regions to call variants in.
+snv_bed: "/path/to/target_panel.bed"               # <-- CHANGE THIS
+
+# --- External tools ---
+# fgbio and picard are managed via conda (workflow/envs/fgbio.yaml and picard.yaml).
+# After running once with --use-conda, find the jar paths with:
+#   find .snakemake/conda -name "fgbio.jar"
+#   find .snakemake/conda -name "picard.jar"
+# Or point to an existing conda env:
+#   find $CONDA_PREFIX -name "fgbio.jar"   (with that env active)
+#
+# ANNOVAR must be installed manually (not available on conda due to licensing).
+# See README for download and database setup instructions.
+tools:
+  fgbio_jar: "/path/to/fgbio.jar"                  # <-- CHANGE THIS
+  picard_jar: "/path/to/picard.jar"                 # <-- CHANGE THIS
+  annovar_annotate: "/path/to/annovar/table_annovar.pl"   # <-- CHANGE THIS
+  annovar_humandb:  "/path/to/annovar/humandb"            # <-- CHANGE THIS
+
+# --- Resources ---
+threads: 16       # default threads per rule
+java_xmx: "32G"  # Java heap size for fgbio / picard
+
+# --- Duplex consensus calling parameters ---
+consensus:
+  call_min: 3              # min reads per strand for SSCS
+  call_min_duplex: 3       # min SSCS family size for DCS
+  base_qual_min: 20        # min input base quality
+  cons_qual_min: 45        # min consensus base quality (filter step)
+  max_base_error_rate: 0.2 # max per-base error rate (filter step)
+  clip_bases: 3            # bases to hard-clip from each read end
+
+# --- Variant calling parameters ---
+variants:
+  map_qual: 23
+  all_freq: "0.000001"     # minimum allele frequency to report

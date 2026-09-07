@@ -1,0 +1,11 @@
+sample_udi	udi	sample	library	fq1	fq2
+# One row per sample. Columns:
+#   sample_udi : unique identifier combining sample name and UDI (used as wildcard throughout pipeline)
+#   udi        : UDI barcode name (e.g. xGenUDI1)
+#   sample     : sample name
+#   library    : library / sequencing run ID
+#   fq1        : absolute path to R1 FASTQ (can be gzipped)
+#   fq2        : absolute path to R2 FASTQ (can be gzipped)
+#
+# Example:
+# MySample_xGenUDI1	xGenUDI1	MySample	SLX-12345	/data/SLX-12345/sample_R1.fq.gz	/data/SLX-12345/sample_R2.fq.gz

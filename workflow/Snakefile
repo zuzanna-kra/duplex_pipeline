@@ -1,0 +1,828 @@
+# =====================================================================
+# Duplex sequencing Snakemake pipeline
+# =====================================================================
+
+import pandas as pd
+from pathlib import Path
+
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
+configfile: "config/config.yaml"
+
+RESULTS  = config["results_dir"]
+REF      = config["reference"]["fasta"]
+THREADS  = config["threads"]
+SNV_BED     = config["snv_bed"]
+
+FGBIO = config["tools"]["fgbio_jar"]
+JAVA_XMX = config["java_xmx"]
+PICARD = config["tools"]["picard_jar"]
+ANNOVAR_annotate = config["tools"]["annovar_annotate"]
+ANNOVAR_humandb = config["tools"]["annovar_humandb"]
+
+CALLMIN = config["consensus"]["call_min"]
+CALLMINDUPLEX = config["consensus"]["call_min_duplex"]
+BASEQUALMIN = config["consensus"]["base_qual_min"]
+CONSQUALMIN = config["consensus"]["cons_qual_min"]
+MAXBASEERRORRATE = config["consensus"]["max_base_error_rate"]
+CLIPBASES = config["consensus"]["clip_bases"]
+ALLFREQ = config["variants"]["all_freq"]
+
+# ----------------------------------------------------------------------
+# Output directories for per-sample results
+# ----------------------------------------------------------------------
+
+SSCS_DIR = "/{sample_udi}/SSCS_files_MUFS" + str(CALLMIN)
+DCS_DIR  = "/{sample_udi}/DCS_files_MUFS"  + str(CALLMINDUPLEX)
+
+# ---------------------------------------------------------------------
+# Sample sheet
+# ---------------------------------------------------------------------
+# Load the TSV into a pandas DataFrame indexed by sample_UDI.
+# `drop=False` keeps sample_UDI as both the index AND a column,
+# which is occasionally handy.
+samples_df = (
+    pd.read_csv(config["samples_tsv"], sep="\t", dtype=str)
+      .set_index("sample_udi", drop=False)
+)
+
+# The list of sample identifiers we'll iterate over with `expand()`.
+SAMPLES = samples_df["sample_udi"].tolist()
+
+# ---------------------------------------------------------------------
+# Helper functions for accessing per-sample metadata inside rules
+# ---------------------------------------------------------------------
+# These are "input functions" — Snakemake calls them with a `wildcards`
+# object and expects them to return a file path (or list of them).
+# They let us look up per-sample info in the TSV at rule-execution time.
+
+def get_fq1(wildcards):
+    return samples_df.loc[wildcards.sample_udi, "fq1"]
+
+def get_fq2(wildcards):
+    return samples_df.loc[wildcards.sample_udi, "fq2"]
+
+def get_sample_name(wildcards):
+    return samples_df.loc[wildcards.sample_udi, "sample"]
+
+def get_library_name(wildcards):
+    return samples_df.loc[wildcards.sample_udi, "library"]
+
+# ---------------------------------------------------------------------
+# Final targets
+# ---------------------------------------------------------------------
+# For the first working version we're aiming at the FastQC reports
+# as the "final" outputs. As we add more rules, this list will grow
+# (and eventually point at the grouped BAM, then the annotated TSVs).
+
+FINAL_OUTPUTS = [
+    # Preprocessing
+    expand(RESULTS + "/{sample_udi}/fastqc/{sample_udi}_fastqc.done",
+           sample_udi=SAMPLES),
+    # Alignment + UMI grouping
+    expand(RESULTS + "/{sample_udi}/{sample_udi}_UMI_grouped.bam",
+           sample_udi=SAMPLES),
+    # Metrics
+    expand(RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_insert_size_metrics.txt",
+           sample_udi=SAMPLES),
+    # SSCS BAM
+    expand(RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam",
+          sample_udi=SAMPLES),
+    # SSCS Variants and annotations
+    expand(RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.tsv",
+        sample_udi=SAMPLES),
+    expand(RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_pileup.txt",
+        sample_udi=SAMPLES),
+    # DCS BAM
+    expand(RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped_sorted.bam",
+          sample_udi=SAMPLES),
+    # DCS Variants and annotations
+    expand(RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.tsv",
+        sample_udi=SAMPLES),
+    expand(RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_pileup.txt",
+        sample_udi=SAMPLES),
+
+]
+
+rule all:
+    input:
+        FINAL_OUTPUTS
+
+
+
+# ---------------------------------------------------------------------
+# Rule: FastQC on raw FASTQs
+# ---------------------------------------------------------------------
+rule fastqc:
+    input:
+        fq1 = get_fq1,
+        fq2 = get_fq2,
+    output:
+        # FastQC produces multiple files per input FASTQ with names derived
+        # from the input filenames — and those derived names are hard to
+        # predict from inside Snakemake. A clean trick is to `touch` a
+        # sentinel file at the end of the rule and declare THAT as the
+        # output. Snakemake tracks the sentinel; the real reports live
+        # in the same directory.
+        done = touch(RESULTS + "/{sample_udi}/fastqc/{sample_udi}_fastqc.done"),
+    params:
+        outdir = RESULTS + "/{sample_udi}/fastqc",
+    threads: THREADS
+    conda: "workflow/envs/fastqc.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        fastqc {input.fq1} {input.fq2} \
+            --outdir {params.outdir} \
+            --threads {threads} \
+            --quiet
+        """
+
+
+# ---------------------------------------------------------------------
+# Rule: FastqtoBam on raw FASTQs
+# ---------------------------------------------------------------------
+
+rule fastq_to_bam:
+    input:
+        fq1 = get_fq1,
+        fq2 = get_fq2,
+    output:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam.bam",
+    params:
+        sample = get_sample_name,
+        library = get_library_name,
+        java_xmx = JAVA_XMX,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io FastqToBam \
+            --input {input.fq1} {input.fq2} \
+            --read-structures 3M2S+T 3M2S+T \
+            --sample {params.sample} \
+            --library {params.library} \
+            --platform-unit FLOWCELL.LANE \
+            --output {output.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio Extract UMIs from BAM
+# ---------------------------------------------------------------------
+
+rule extract_umis:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam.bam",
+    output:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam_UMI.bam",
+    params:
+        java_xmx = JAVA_XMX,
+        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        mkdir -p {params.tmp_dir}
+        java -Xmx{params.java_xmx} -jar {FGBIO} --tmp-dir {params.tmp_dir} \
+            ExtractUmisFromBam \
+            --input {input.bam} \
+            --output {output.bam} \
+            --read-structure 3M2S+T \
+            --read-structure 3M2S+T \
+            --molecular-index-tags ZA ZB \
+            --single-tag RX
+        """
+
+# ---------------------------------------------------------------------
+# Rule: BWA MEM alignment to reference
+# ---------------------------------------------------------------------
+
+rule align_and_merge:
+    input:
+        unmapped = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam_UMI.bam",
+    output:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged.bam",
+    log:
+        RESULTS + "/{sample_udi}/logs/align_merge.log",
+    params:
+        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
+        java_xmx = JAVA_XMX,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        mkdir -p {params.tmp_dir} $(dirname {log})
+        (
+        samtools fastq -n \
+            -1 {params.tmp_dir}/r1.fq.gz \
+            -2 {params.tmp_dir}/r2.fq.gz \
+            {input.unmapped}
+
+        bwa mem -t {threads} {REF} \
+            {params.tmp_dir}/r1.fq.gz \
+            {params.tmp_dir}/r2.fq.gz \
+            | samtools view -b -o {params.tmp_dir}/aligned.bam
+
+        java -Xmx{params.java_xmx} -jar {FGBIO} --tmp-dir {params.tmp_dir} ZipperBams \
+        --unmapped {input.unmapped} \
+        --input {params.tmp_dir}/aligned.bam \
+        --output {output.bam} \
+        --ref {REF}
+        ) 2> {log}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools sort merged BAM by coordinates for grouping
+# ---------------------------------------------------------------------
+
+rule sort_merged_bam:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged.bam",
+    output:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged_sorted.bam",
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools sort --template-coordinate -@ {threads} \
+            -o {output.bam} {input.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Picard collect insert size metrics
+# ---------------------------------------------------------------------
+
+rule insert_size_metrics:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged_sorted.bam",
+    output:
+        metrics = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_insert_size_metrics.txt",
+        histogram = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_insert_size_histogram.pdf",
+    params:
+        outdir = RESULTS + "/{sample_udi}/Metrics_and_images",
+    conda: "workflow/envs/picard.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        java -jar {PICARD} CollectInsertSizeMetrics \
+            I={input.bam} \
+            O={output.metrics} \
+            H={output.histogram}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio GroupReadsByUmi to group reads into families and generate UMI metrics
+# ---------------------------------------------------------------------
+
+rule group_reads_by_umi:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged_sorted.bam",
+    output:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_UMI_grouped.bam",
+        family_histogram = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_family_size_histogram.txt",
+        umi_metrics = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_SSCS_UMI_metrics.txt",
+    params:
+        java_xmx = JAVA_XMX,
+        outdir = RESULTS + "/{sample_udi}/Metrics_and_images",
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io GroupReadsByUmi \
+            --input {input.bam} \
+            --strategy Paired \
+            --edits 1 \
+            --output {output.bam} \
+            --family-size-histogram {output.family_histogram} \
+            --grouping-metrics {output.umi_metrics} \
+            --threads {threads}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio CallMolecularConsensusReads to generate SSCS BAM
+# ---------------------------------------------------------------------
+
+rule call_sscs:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_UMI_grouped.bam",
+    output:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_unmapped.bam",
+    params:
+        java_xmx = JAVA_XMX,
+        call_min = CALLMIN,
+        base_qual_min = BASEQUALMIN,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io CallMolecularConsensusReads \
+            --input {input.bam} \
+            --output {output.bam} \
+            --min-reads {params.call_min} \
+            --min-input-base-quality {params.base_qual_min} \
+            --threads {threads}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools, BWA and Fgbio to map SSCS BAM to reference and generate mapped and merged BAM
+# ---------------------------------------------------------------------
+
+rule map_merge_SSCS:
+    input:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_unmapped.bam",
+    output:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped.bam",
+    params:
+        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
+        java_xmx = JAVA_XMX,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools fastq {input.bam} \
+          | bwa mem -t {threads} -p -K 150000000 -Y {REF} - \
+          | java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io ZipperBams \
+              --unmapped {input.bam} \
+              --ref {REF} \
+              --tags-to-reverse Consensus \
+              --tags-to-revcomp Consensus \
+              --output {output.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio and Samtools to filter SSCS BAM and sort by name for ClipBam
+# ---------------------------------------------------------------------
+
+rule filter_sort_SSCS:
+    input:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped.bam",
+    output:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered.bam",
+    params:
+        java_xmx = JAVA_XMX,
+        call_min = CALLMIN,
+        cons_qual_min = CONSQUALMIN,
+        max_base_error_rate = MAXBASEERRORRATE,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 FilterConsensusReads \
+            --input {input.bam} \
+            --output /dev/stdout \
+            --ref {REF} \
+            --min-reads {params.call_min} \
+            --min-base-quality {params.cons_qual_min} \
+            --max-base-error-rate {params.max_base_error_rate} \
+            | samtools sort -n --threads {threads} -o {output.bam} -
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio to clip bases from SSCS BAM
+# ---------------------------------------------------------------------
+
+rule clip_SSCS:
+    input:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered.bam",
+    output:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped.bam",
+        metrics = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_SSCS_overlap_metrics.txt",
+    params:
+        java_xmx = JAVA_XMX,
+        ref = REF,
+        clip_bases = CLIPBASES,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 ClipBam \
+        --input {input.bam} \
+        --output {output.bam} \
+        --ref {params.ref} \
+        --clipping-mode Hard \
+        --clip-overlapping-reads true \
+        --read-one-five-prime {params.clip_bases} \
+        --read-one-three-prime {params.clip_bases} \
+        --read-two-five-prime {params.clip_bases} \
+        --read-two-three-prime {params.clip_bases} \
+        --metrics {output.metrics}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools to sort clipped SSCS BAM by coordinates and index
+# ---------------------------------------------------------------------
+
+rule sort_index_SSCS:
+    input:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped.bam",
+    output:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam",
+        bai = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam.bai",
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools sort -@ {threads} -o {output.bam} {input.bam}
+        samtools index {output.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: VardictJava to call SSCS variants
+# ---------------------------------------------------------------------
+
+rule call_variants_SSCS:
+    input:
+        bam = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam",
+    output:
+        vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants.vcf.gz",
+    params:
+        outdir = RESULTS + "/{sample_udi}/Variants",
+        ref = REF,
+        bed = SNV_BED,
+        allfreq = ALLFREQ,
+    threads: THREADS,
+    conda: "workflow/envs/vardict.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        vardict-java \
+            -G {params.ref} \
+            -N {wildcards.sample_udi} \
+            -b {input.bam} \
+            -z 1 \
+            -c 1 -S 2 -E 3 -g 4 \
+            -f {params.allfreq} \
+            -r 1 \
+            -Q {BASEQUALMIN} \
+            -q 0 \
+            -o 0 \
+            -k 0 \
+            -y \
+            -th {threads} \
+            {params.bed} \
+            | teststrandbias.R \
+            | var2vcf_valid.pl -N {wildcards.sample_udi} -E -f {params.allfreq} \
+            | bgzip -c > {output.vcf}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Annovar annotate SSCS variants
+# NOTE: ANNOVAR is not available via conda due to licensing restrictions.
+#       It must be installed manually. See README for instructions.
+# ---------------------------------------------------------------------
+
+rule annotate_variants_SSCS:
+    input:
+        vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants.vcf.gz",
+    output:
+        multianno_vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.hg38_multianno.vcf",
+    params:
+        annovar_annotate = ANNOVAR_annotate,
+        annovar_humandb = ANNOVAR_humandb,
+        out_prefix = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated",
+    threads: THREADS
+    shell:
+        """
+        perl {params.annovar_annotate} {input.vcf} {params.annovar_humandb}/ \
+            -buildver hg38 \
+            -vcfinput \
+            -out {params.out_prefix} \
+            -remove \
+            -protocol refGene,cosmic102_coding,cosmic101_noncoding,exac03,gnomad_genome,clinvar_20240917 \
+            -operation g,f,f,f,f,f \
+            -nastring . \
+            -thread {threads}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Annovar compress and index annotated VCF
+# ---------------------------------------------------------------------
+
+rule compress_index_annotated_vcf_SSCS:
+    input:
+        annotated_vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.hg38_multianno.vcf",
+    output:
+        annotated_vcf_gz = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.hg38_multianno.vcf.gz",
+        annotated_vcf_gz_tbi = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.hg38_multianno.vcf.gz.tbi",
+    threads: THREADS
+    conda: "workflow/envs/bcftools.yaml"
+    shell:
+        """
+        bgzip -c {input.annotated_vcf} > {output.annotated_vcf_gz}
+        tabix -p vcf {output.annotated_vcf_gz}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Bcftools query to create TSV file with SSCS variants and their annotations
+# ---------------------------------------------------------------------
+
+rule create_annotated_SSCS_tsv:
+    input:
+        annotated_vcf_gz = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.hg38_multianno.vcf.gz",
+    output:
+        annotated_VarDict_SSCS_tsv = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_variants_annotated.tsv",
+    conda: "workflow/envs/bcftools.yaml"
+    shell:
+        """
+        bcftools query --allow-undef-tags \
+        -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/DP\\t%INFO/VD\\t%INFO/AF\\t%INFO/Func.refGene\\t%INFO/Gene.refGene\\t%INFO/ExonicFunc.refGene\\t%INFO/gnomAD_genome_ALL\\t%INFO/CLNSIG\\n' \
+        {input.annotated_vcf_gz} \
+        > {output.annotated_VarDict_SSCS_tsv}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools mpileup to create pileup file for SSCS BAM at SNV positions
+# ---------------------------------------------------------------------
+
+rule create_pileup_SSCS:
+    input:
+        SSCS_clipped_sorted = RESULTS + SSCS_DIR + "/{sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam",
+    output:
+        pileup_SSCS = RESULTS + "/{sample_udi}/Variants/{sample_udi}_SSCS_pileup.txt",
+    params:
+        ref = REF,
+        snv_bed = SNV_BED,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools mpileup \
+            -A \
+            -q 0 \
+            -Q 0 \
+            -B \
+            -a \
+            -f {REF} \
+            -d 1000000 \
+            -l "{params.snv_bed}" \
+            {input.SSCS_clipped_sorted} \
+            > {output.pileup_SSCS}
+        """
+
+
+# ---------------------------------------------------------------------
+# DCS generation and variant calling.
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio CallDuplexConsensusReads to generate DCS BAM
+# ---------------------------------------------------------------------
+
+rule call_dcs:
+    input:
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_UMI_grouped.bam",
+    output:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_unmapped.bam",
+    params:
+        java_xmx = JAVA_XMX,
+        call_min = CALLMIN,
+        base_qual_min = BASEQUALMIN,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io CallDuplexConsensusReads \
+            --input {input.bam} \
+            --output {output.bam} \
+            --min-reads {params.call_min} \
+            --min-input-base-quality {params.base_qual_min} \
+            --threads {threads}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools, BWA and Fgbio to map DCS BAM to reference and generate mapped and merged BAM
+# ---------------------------------------------------------------------
+
+rule map_merge_DCS:
+    input:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_unmapped.bam",
+    output:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped.bam",
+    params:
+        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
+        java_xmx = JAVA_XMX,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools fastq {input.bam} \
+          | bwa mem -t {threads} -p -K 150000000 -Y {REF} - \
+          | java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io ZipperBams \
+              --unmapped {input.bam} \
+              --ref {REF} \
+              --tags-to-reverse Consensus \
+              --tags-to-revcomp Consensus \
+              --output {output.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio and Samtools to filter DCS BAM and sort by name for ClipBam
+# ---------------------------------------------------------------------
+
+rule filter_sort_DCS:
+    input:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped.bam",
+    output:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered.bam",
+    params:
+        java_xmx = JAVA_XMX,
+        call_min = CALLMIN,
+        cons_qual_min = CONSQUALMIN,
+        max_base_error_rate = MAXBASEERRORRATE,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 FilterConsensusReads \
+            --input {input.bam} \
+            --output /dev/stdout \
+            --ref {REF} \
+            --min-reads {params.call_min} \
+            --min-base-quality {params.cons_qual_min} \
+            --max-base-error-rate {params.max_base_error_rate} \
+            | samtools sort -n --threads {threads} -o {output.bam} -
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Fgbio to clip bases from DCS BAM
+# ---------------------------------------------------------------------
+
+rule clip_DCS:
+    input:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered.bam",
+    output:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped.bam",
+        metrics = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_DCS_overlap_metrics.txt",
+    params:
+        java_xmx = JAVA_XMX,
+        ref = REF,
+        clip_bases = CLIPBASES,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 ClipBam \
+        --input {input.bam} \
+        --output {output.bam} \
+        --ref {params.ref} \
+        --clipping-mode Hard \
+        --clip-overlapping-reads true \
+        --read-one-five-prime {params.clip_bases} \
+        --read-one-three-prime {params.clip_bases} \
+        --read-two-five-prime {params.clip_bases} \
+        --read-two-three-prime {params.clip_bases} \
+        --metrics {output.metrics}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools to sort clipped DCS BAM by coordinates and index
+# ---------------------------------------------------------------------
+
+rule sort_index_DCS:
+    input:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped.bam",
+    output:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped_sorted.bam",
+        bai = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped_sorted.bam.bai",
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools sort -@ {threads} -o {output.bam} {input.bam}
+        samtools index {output.bam}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: VardictJava to call DCS variants
+# ---------------------------------------------------------------------
+
+rule call_variants_DCS:
+    input:
+        bam = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped_sorted.bam",
+    output:
+        vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants.vcf.gz",
+    params:
+        outdir = RESULTS + "/{sample_udi}/Variants",
+        ref = REF,
+        bed = SNV_BED,
+        allfreq = ALLFREQ,
+    threads: THREADS,
+    conda: "workflow/envs/vardict.yaml"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        vardict-java \
+            -G {params.ref} \
+            -N {wildcards.sample_udi} \
+            -b {input.bam} \
+            -z 1 \
+            -c 1 -S 2 -E 3 -g 4 \
+            -f {params.allfreq} \
+            -r 1 \
+            -Q {BASEQUALMIN} \
+            -q 0 \
+            -o 0 \
+            -k 0 \
+            -y \
+            -th {threads} \
+            {params.bed} \
+            | teststrandbias.R \
+            | var2vcf_valid.pl -N {wildcards.sample_udi} -E -f {params.allfreq} \
+            | bgzip -c > {output.vcf}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Annovar annotate DCS variants
+# NOTE: ANNOVAR is not available via conda due to licensing restrictions.
+#       It must be installed manually. See README for instructions.
+# ---------------------------------------------------------------------
+
+rule annotate_variants_DCS:
+    input:
+        vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants.vcf.gz",
+    output:
+        multianno_vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.hg38_multianno.vcf",
+    params:
+        annovar_annotate = ANNOVAR_annotate,
+        annovar_humandb = ANNOVAR_humandb,
+        out_prefix = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated",
+    threads: THREADS
+    shell:
+        """
+        perl {params.annovar_annotate} {input.vcf} {params.annovar_humandb}/ \
+            -buildver hg38 \
+            -vcfinput \
+            -out {params.out_prefix} \
+            -remove \
+            -protocol refGene,cosmic102_coding,cosmic101_noncoding,exac03,gnomad_genome,clinvar_20240917 \
+            -operation g,f,f,f,f,f \
+            -nastring . \
+            -thread {threads}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Annovar compress and index annotated VCF
+# ---------------------------------------------------------------------
+
+rule compress_index_annotated_vcf_DCS:
+    input:
+        annotated_vcf = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.hg38_multianno.vcf",
+    output:
+        annotated_vcf_gz = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.hg38_multianno.vcf.gz",
+        annotated_vcf_gz_tbi = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.hg38_multianno.vcf.gz.tbi",
+    threads: THREADS
+    conda: "workflow/envs/bcftools.yaml"
+    shell:
+        """
+        bgzip -c {input.annotated_vcf} > {output.annotated_vcf_gz}
+        tabix -p vcf {output.annotated_vcf_gz}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Bcftools query to create TSV file with DCS variants and their annotations
+# ---------------------------------------------------------------------
+
+rule create_annotated_DCS_tsv:
+    input:
+        annotated_vcf_gz = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.hg38_multianno.vcf.gz",
+    output:
+        annotated_VarDict_DCS_tsv = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_variants_annotated.tsv",
+    conda: "workflow/envs/bcftools.yaml"
+    shell:
+        """
+        bcftools query --allow-undef-tags \
+        -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/DP\\t%INFO/VD\\t%INFO/AF\\t%INFO/Func.refGene\\t%INFO/Gene.refGene\\t%INFO/ExonicFunc.refGene\\t%INFO/gnomAD_genome_ALL\\t%INFO/CLNSIG\\n' \
+        {input.annotated_vcf_gz} \
+        > {output.annotated_VarDict_DCS_tsv}
+        """
+
+# ---------------------------------------------------------------------
+# Rule: Samtools mpileup to create pileup file for DCS BAM at SNV positions
+# ---------------------------------------------------------------------
+
+rule create_pileup_DCS:
+    input:
+        DCS_clipped_sorted = RESULTS + DCS_DIR + "/{sample_udi}_DCS_mapped_filtered_clipped_sorted.bam",
+    output:
+        pileup_DCS = RESULTS + "/{sample_udi}/Variants/{sample_udi}_DCS_pileup.txt",
+    params:
+        ref = REF,
+        snv_bed = SNV_BED,
+    threads: THREADS
+    conda: "workflow/envs/fgbio.yaml"
+    shell:
+        """
+        samtools mpileup \
+            -A \
+            -q 0 \
+            -Q 0 \
+            -B \
+            -a \
+            -f {REF} \
+            -d 1000000 \
+            -l "{params.snv_bed}" \
+            {input.DCS_clipped_sorted} \
+            > {output.pileup_DCS}
+        """

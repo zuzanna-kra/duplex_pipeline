@@ -1,0 +1,9 @@
+name: fgbio
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - fgbio>=2.0.2
+  - samtools>=1.17
+  - bwa>=0.7.17
