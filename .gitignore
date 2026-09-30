@@ -17,3 +17,6 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# Server-specific config with real paths (never commit)
+config/config.local.yaml

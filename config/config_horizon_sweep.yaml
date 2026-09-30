@@ -3,9 +3,9 @@
 # Reuses the UMI-grouped BAMs from the legacy shell run, calls consensus
 # once permissively and filters at 6-3-3 / 4-2-2 / 3-2-1.
 #
-#   snakemake -s workflow/Snakefile --configfile config/config_horizon_sweep.yaml \
+#   snakemake -s workflow/Snakefile --configfile config/config.local.yaml config/config_horizon_sweep.yaml \
 #             --use-conda --conda-frontend conda --cores 32
-# Values here override config/config.yaml.
+# Later files override earlier ones: config.yaml < config.local.yaml < this file.
 # =====================================================================
 
 samples_tsv: "config/samples_horizon.tsv"
@@ -14,15 +14,22 @@ run_name: "horizon_consensus_sweep"
 
 existing_grouped_bam: "/powervault/zuzanna/horizon_legacy_duplex/standard_hybridisation/{sample_udi}/{sample}_UMI_grouped.bam"
 
-# --- CHECK these paths (taken from the defaults in shell/data_processing_v12.sh) ---
-reference:
-  fasta: "/home/zk292@blue.cam.ac.uk/references/hg38/hg38.fa"
-snv_bed: "/home/zk292@blue.cam.ac.uk/panels/MDS_screening.bed"
-tools:
-  fgbio_jar: "/home/zk292@blue.cam.ac.uk/miniconda3/envs/nanoseq/share/fgbio/fgbio.jar"
-  picard_jar: "/home/zk292@blue.cam.ac.uk/miniconda3/envs/nanoseq/share/picard-3.4.0-0/picard.jar"
-  annovar_annotate: "/home/zk292@blue.cam.ac.uk/tools/annovar/table_annovar.pl"
-  annovar_humandb: "/home/zk292@blue.cam.ac.uk/tools/annovar/humandb"
+# Paths (reference, BED, jars, ANNOVAR) are NOT set here: they come from your
+# server-only config/config.local.yaml (not in git). Run with:
+#   --configfile config/config.local.yaml config/config_horizon_sweep.yaml
+
+consensus:
+  call_min_reads_sscs: 1
+  call_min_reads_duplex: "1 1 0"
+  base_qual_min: 20
+  cons_qual_min: 45
+  max_base_error_rate: 0.2
+  clip_bases: 3
+
+filter_settings:
+  "6-3-3": {duplex: "6 3 3", sscs: 3}
+  "4-2-2": {duplex: "4 2 2", sscs: 2}
+  "3-2-1": {duplex: "3 2 1", sscs: 1}
 
 threads: 8
 java_xmx: "16G"
