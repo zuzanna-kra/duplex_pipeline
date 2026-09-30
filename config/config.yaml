@@ -48,13 +48,26 @@ threads: 16       # default threads per rule
 java_xmx: "32G"  # Java heap size for fgbio / picard
 
 # --- Duplex consensus calling parameters ---
+# Consensus is CALLED ONCE permissively, then FILTERED at each setting below
+# (filtering is much faster than re-calling).
 consensus:
-  call_min: 3              # min reads per strand for SSCS
-  call_min_duplex: 3       # min SSCS family size for DCS
-  base_qual_min: 20        # min input base quality
-  cons_qual_min: 45        # min consensus base quality (filter step)
-  max_base_error_rate: 0.2 # max per-base error rate (filter step)
-  clip_bases: 3            # bases to hard-clip from each read end
+  call_min_reads_sscs: 1          # CallMolecularConsensusReads --min-reads
+  call_min_reads_duplex: "1 1 0"  # CallDuplexConsensusReads --min-reads (total, AB, BA)
+  base_qual_min: 20               # min input base quality
+  cons_qual_min: 45               # min consensus base quality (filter step)
+  max_base_error_rate: 0.2        # max per-base error rate (filter step)
+  clip_bases: 3                   # bases to hard-clip from each read end
+
+# --- Filter settings to compare (FilterConsensusReads --min-reads) ---
+# name: {duplex: "total AB BA", sscs: min reads per single-strand family}
+filter_settings:
+  "6-3-3": {duplex: "6 3 3", sscs: 3}
+  "4-2-2": {duplex: "4 2 2", sscs: 2}
+  "3-2-1": {duplex: "3 2 1", sscs: 1}
+
+# --- Optional: reuse existing UMI-grouped BAMs (skips FASTQ -> grouping) ---
+# Pattern can use {sample_udi} and {sample}. Leave "" to run from FASTQ.
+existing_grouped_bam: ""
 
 # --- Variant calling parameters ---
 variants:

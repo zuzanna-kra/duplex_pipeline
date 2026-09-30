@@ -1,0 +1,28 @@
+# =====================================================================
+# Horizon consensus-threshold sweep (SLX-27639, standard hybridisation)
+# Reuses the UMI-grouped BAMs from the legacy shell run, calls consensus
+# once permissively and filters at 6-3-3 / 4-2-2 / 3-2-1.
+#
+#   snakemake -s workflow/Snakefile --configfile config/config_horizon_sweep.yaml \
+#             --use-conda --conda-frontend conda --cores 32
+# Values here override config/config.yaml.
+# =====================================================================
+
+samples_tsv: "config/samples_horizon.tsv"
+results_dir: "/powervault/zuzanna/horizon_legacy_duplex/snakemake_consensus_sweep"
+run_name: "horizon_consensus_sweep"
+
+existing_grouped_bam: "/powervault/zuzanna/horizon_legacy_duplex/standard_hybridisation/{sample_udi}/{sample}_UMI_grouped.bam"
+
+# --- CHECK these paths (taken from the defaults in shell/data_processing_v12.sh) ---
+reference:
+  fasta: "/home/zk292@blue.cam.ac.uk/references/hg38/hg38.fa"
+snv_bed: "/home/zk292@blue.cam.ac.uk/panels/MDS_screening.bed"
+tools:
+  fgbio_jar: "/home/zk292@blue.cam.ac.uk/miniconda3/envs/nanoseq/share/fgbio/fgbio.jar"
+  picard_jar: "/home/zk292@blue.cam.ac.uk/miniconda3/envs/nanoseq/share/picard-3.4.0-0/picard.jar"
+  annovar_annotate: "/home/zk292@blue.cam.ac.uk/tools/annovar/table_annovar.pl"
+  annovar_humandb: "/home/zk292@blue.cam.ac.uk/tools/annovar/humandb"
+
+threads: 8
+java_xmx: "16G"
