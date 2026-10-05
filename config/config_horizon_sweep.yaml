@@ -1,7 +1,7 @@
 # =====================================================================
 # Horizon consensus-threshold sweep (SLX-27639, standard hybridisation)
 # Reuses the UMI-grouped BAMs from the legacy shell run, calls consensus
-# once permissively and filters at 6-3-3 / 4-2-2 / 3-2-1.
+# once permissively and filters at 6-3-3 / 4-2-2 / 3-2-1 / 2-1-1.
 #
 #   snakemake -s workflow/Snakefile --configfile config/config.local.yaml config/config_horizon_sweep.yaml \
 #             --use-conda --conda-frontend conda --cores 32
@@ -30,6 +30,7 @@ filter_settings:
   "6-3-3": {duplex: "6 3 3", sscs: 3}
   "4-2-2": {duplex: "4 2 2", sscs: 2}
   "3-2-1": {duplex: "3 2 1", sscs: 1}
+  "2-1-1": {duplex: "2 1 1", sscs: 1}   # added for the Phase 1 report (SSCS identical to 3-2-1)
 
 threads: 8
 java_xmx: "16G"
