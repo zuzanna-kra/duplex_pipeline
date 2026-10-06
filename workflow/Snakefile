@@ -38,6 +38,11 @@ LAYERS   = ["SSCS", "DCS"]
 # instead of re-running FASTQ -> grouping. Pattern may use {sample_udi} and {sample}.
 EXISTING_GROUPED = config.get("existing_grouped_bam") or ""
 
+# Optional: start from existing FastqToBam outputs (unmapped BAM with the UMI
+# already in RX and the 5 UMI+skip bases removed), skipping FASTQ -> BAM.
+# Pattern may use {sample_udi} and {sample}.
+EXISTING_UNMAPPED = config.get("existing_unmapped_bam") or ""
+
 # ----------------------------------------------------------------------
 # Output directories
 # ----------------------------------------------------------------------
@@ -91,6 +96,13 @@ def grouped_bam(wildcards):
                                        sample=samples_df.loc[wildcards.sample_udi, "sample"])
     return RESULTS + f"/{wildcards.sample_udi}/{wildcards.sample_udi}_UMI_grouped.bam"
 
+def unmapped_bam(wildcards):
+    """Unmapped BAM with RX set: from fastq_to_bam, or an existing one (config)."""
+    if EXISTING_UNMAPPED:
+        return EXISTING_UNMAPPED.format(sample_udi=wildcards.sample_udi,
+                                        sample=samples_df.loc[wildcards.sample_udi, "sample"])
+    return RESULTS + f"/{wildcards.sample_udi}/{wildcards.sample_udi}_unmapped_bam.bam"
+
 def filter_min_reads(wildcards):
     """--min-reads for FilterConsensusReads: 1 value for SSCS, 3 for DCS."""
     fs = FILTER_SETTINGS[wildcards.setting]
@@ -121,7 +133,12 @@ SWEEP_OUTPUTS = [
 ]
 
 # When starting from existing grouped BAMs, don't ask for FASTQ-level outputs.
-FINAL_OUTPUTS = SWEEP_OUTPUTS + ([] if EXISTING_GROUPED else PREPROCESSING_OUTPUTS)
+if EXISTING_GROUPED:
+    FINAL_OUTPUTS = SWEEP_OUTPUTS
+elif EXISTING_UNMAPPED:
+    FINAL_OUTPUTS = SWEEP_OUTPUTS + PREPROCESSING_OUTPUTS[1:]   # no FASTQ, so no FastQC
+else:
+    FINAL_OUTPUTS = SWEEP_OUTPUTS + PREPROCESSING_OUTPUTS
 
 rule all:
     input:
@@ -179,38 +196,18 @@ rule fastq_to_bam:
         java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io FastqToBam \
             --input {input.fq1} {input.fq2} \
             --read-structures 3M2S+T 3M2S+T \
+            --umi-tag RX \
             --sample {params.sample} \
             --library {params.library} \
             --platform-unit FLOWCELL.LANE \
             --output {output.bam}
         """
 
-# ---------------------------------------------------------------------
-# Rule: Fgbio Extract UMIs from BAM
-# ---------------------------------------------------------------------
-
-rule extract_umis:
-    input:
-        bam = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam.bam",
-    output:
-        bam = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam_UMI.bam",
-    params:
-        java_xmx = JAVA_XMX,
-        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
-    threads: THREADS
-    conda: "envs/fgbio.yaml"
-    shell:
-        """
-        mkdir -p {params.tmp_dir}
-        java -Xmx{params.java_xmx} -jar {FGBIO} --tmp-dir {params.tmp_dir} \
-            ExtractUmisFromBam \
-            --input {input.bam} \
-            --output {output.bam} \
-            --read-structure 3M2S+T \
-            --read-structure 3M2S+T \
-            --molecular-index-tags ZA ZB \
-            --single-tag RX
-        """
+# NOTE: there is deliberately no ExtractUmisFromBam step. FastqToBam with
+# --read-structures 3M2S+T already writes the UMI to RX and removes the 5
+# UMI+skip bases. Running ExtractUmisFromBam on its output (as this pipeline
+# did up to tag backup/double-umi-extraction) removed a further 5 bases and
+# overwrote RX with genomic bases 6-8 of each read.
 
 # ---------------------------------------------------------------------
 # Rule: BWA MEM alignment to reference
@@ -218,7 +215,7 @@ rule extract_umis:
 
 rule align_and_merge:
     input:
-        unmapped = RESULTS + "/{sample_udi}/{sample_udi}_unmapped_bam_UMI.bam",
+        unmapped = unmapped_bam,
     output:
         bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged.bam",
     log:
