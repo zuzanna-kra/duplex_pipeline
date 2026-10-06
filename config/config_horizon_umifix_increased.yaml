@@ -1,0 +1,39 @@
+# =====================================================================
+# Increased-input hybridisation rerun after the UMI-extraction fix (SLX-27640)
+#
+# Starts from the legacy run's FastqToBam outputs ({sample}_unmapped_bam.bam:
+# 145 bp reads, true UMI in RX), which were correct. Everything from alignment
+# onward is redone: align + ZipperBams -> template sort -> GroupReadsByUmi ->
+# permissive consensus -> filter at 6-3-3 / 4-2-2 / 3-2-1 / 2-1-1 -> calls.
+#
+#   snakemake -s workflow/Snakefile \
+#       --configfile config/config.local.yaml config/config_horizon_umifix_increased.yaml \
+#       --use-conda --conda-frontend conda --cores 32   # second/third instance alongside the standard run
+#
+# Writes to a NEW results_dir, so the old (buggy) sweep and legacy outputs are
+# left untouched for comparison.
+# =====================================================================
+
+samples_tsv: "config/samples_horizon_increased.tsv"
+results_dir: "/powervault/zuzanna/horizon_legacy_duplex/snakemake_umifix_increased"
+run_name: "horizon_umifix_increased"
+
+existing_unmapped_bam: "/powervault/zuzanna/horizon_legacy_duplex/increased_hybridisation/{sample_udi}/{sample}_unmapped_bam.bam"
+existing_grouped_bam: ""     # must stay empty: the old grouped BAMs carry the wrong RX
+
+consensus:
+  call_min_reads_sscs: 1
+  call_min_reads_duplex: "1 1 0"
+  base_qual_min: 20
+  cons_qual_min: 45
+  max_base_error_rate: 0.2
+  clip_bases: 3
+
+filter_settings:
+  "6-3-3": {duplex: "6 3 3", sscs: 3}
+  "4-2-2": {duplex: "4 2 2", sscs: 2}
+  "3-2-1": {duplex: "3 2 1", sscs: 1}
+  "2-1-1": {duplex: "2 1 1", sscs: 1}
+
+threads: 8
+java_xmx: "16G"
