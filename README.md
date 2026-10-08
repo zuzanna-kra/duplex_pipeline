@@ -69,14 +69,25 @@ find .snakemake/conda -name "picard.jar"  # copy this path to picard_jar
 ### 5. Run
 
 ```bash
-snakemake --use-conda --conda-frontend conda --cores 16
+snakemake --use-conda --conda-frontend conda \
+    --cores 80 --resources mem_mb=190000 annovar=4
 ```
+
+`--cores` and `--resources mem_mb` are the totals Snakemake may use at once
+(RADT-OUILLE guidance: ≤80 threads, <200 GB RAM). Each rule declares its own
+threads and `mem_mb` (`DEFAULT_RESOURCES` in `workflow/Snakefile`, overridable
+under `resources:` in a config file), so Snakemake packs jobs under both limits.
+`annovar=4` caps how many ANNOVAR jobs read the databases at once. If several
+runs share the server, split the totals between them.
+
+To resume a run made with an older version of the Snakefile without redoing
+finished steps, add `--rerun-triggers mtime` (Snakemake ≥ 7.8).
 
 On first run, Snakemake builds the conda environments (5–10 min). Subsequent runs reuse them.
 
 **Dry run** (check the DAG without executing):
 ```bash
-snakemake --use-conda --cores 16 -n
+snakemake --use-conda --cores 80 --resources mem_mb=190000 annovar=4 -n
 ```
 
 ---

@@ -8,7 +8,9 @@
 #
 #   snakemake -s workflow/Snakefile \
 #       --configfile config/config.local.yaml config/config_horizon_umifix.yaml \
-#       --use-conda --conda-frontend conda --cores 32
+#       --use-conda --conda-frontend conda \
+#       --cores 80 --resources mem_mb=190000 annovar=4
+#   (split --cores / mem_mb / annovar between runs if several go at once)
 #
 # Writes to a NEW results_dir, so the old (buggy) sweep and legacy outputs are
 # left untouched for comparison.
@@ -35,5 +37,4 @@ filter_settings:
   "3-2-1": {duplex: "3 2 1", sscs: 1}
   "2-1-1": {duplex: "2 1 1", sscs: 1}
 
-threads: 8
-java_xmx: "16G"
+# threads / RAM: per-rule defaults in workflow/Snakefile (override under resources:)

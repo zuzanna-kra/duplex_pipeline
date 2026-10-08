@@ -4,7 +4,9 @@
 # once permissively and filters at 6-3-3 / 4-2-2 / 3-2-1 / 2-1-1.
 #
 #   snakemake -s workflow/Snakefile --configfile config/config.local.yaml config/config_horizon_sweep.yaml \
-#             --use-conda --conda-frontend conda --cores 32
+#             --use-conda --conda-frontend conda \
+#       --cores 80 --resources mem_mb=190000 annovar=4
+#   (split --cores / mem_mb / annovar between runs if several go at once)
 # Later files override earlier ones: config.yaml < config.local.yaml < this file.
 # =====================================================================
 
@@ -32,5 +34,4 @@ filter_settings:
   "3-2-1": {duplex: "3 2 1", sscs: 1}
   "2-1-1": {duplex: "2 1 1", sscs: 1}   # added for the Phase 1 report (SSCS identical to 3-2-1)
 
-threads: 8
-java_xmx: "16G"
+# threads / RAM: per-rule defaults in workflow/Snakefile (override under resources:)

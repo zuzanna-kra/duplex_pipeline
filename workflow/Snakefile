@@ -12,12 +12,66 @@ configfile: "config/config.yaml"
 
 RESULTS  = config["results_dir"]
 REF      = config["reference"]["fasta"]
-THREADS  = config["threads"]
 SNV_BED     = config["snv_bed"]
 
 FGBIO = config["tools"]["fgbio_jar"]
-JAVA_XMX = config["java_xmx"]
 PICARD = config["tools"]["picard_jar"]
+
+# ---------------------------------------------------------------------
+# Per-rule threads / RAM (RADT-OUILLE: 96 cores, 256 GB)
+# ---------------------------------------------------------------------
+# Server guidance: <= 80 threads and < 200 GB RAM in total at once;
+# bwa scales to ~32 threads, samtools/Picard/fgbio to ~24.
+# Snakemake enforces the totals when run with
+#     --cores 80 --resources mem_mb=190000
+# (split these between instances if several runs go at once).
+#
+#   threads : what Snakemake reserves for the job
+#   mem_mb  : what Snakemake counts against --resources mem_mb
+#             (Java: -Xmx is heap only, so mem_mb ~ Xmx + 20-25%)
+#   xmx     : Java heap for fgbio / Picard / VarDict
+#   samtools sort -m is PER THREAD (sort_threads x sort_mem in total).
+#
+# Any entry can be overridden in a config file under `resources:`.
+DEFAULT_RESOURCES = {
+    "fastqc":          {"threads": 2,  "mem_mb": 2000},
+    "fastq_to_bam":    {"threads": 3,  "mem_mb": 6000,  "xmx": "4G"},   # single-threaded + async-io
+    "align":           {"threads": 26, "mem_mb": 24000, "xmx": "4G",    # bwa + ZipperBams + template sort
+                        "bwa_threads": 24, "sort_threads": 4, "sort_mem": "2G"},
+    "insert_size":     {"threads": 1,  "mem_mb": 6000,  "xmx": "4G"},
+    "group":           {"threads": 4,  "mem_mb": 20000, "xmx": "16G"},  # mostly single-threaded
+    "consensus":       {"threads": 16, "mem_mb": 20000, "xmx": "16G"},  # slowest step, scales well
+    "map_consensus":   {"threads": 16, "mem_mb": 12000, "xmx": "4G",
+                        "bwa_threads": 14},
+    "filter":          {"threads": 4,  "mem_mb": 12000, "xmx": "8G",    # filter (1) + name sort
+                        "sort_threads": 3, "sort_mem": "1G"},
+    "clip":            {"threads": 4,  "mem_mb": 8000,  "xmx": "4G",    # ClipBam (1) + coord sort
+                        "sort_threads": 3, "sort_mem": "1G"},
+    "vardict":         {"threads": 4,  "mem_mb": 10000, "xmx": "8G"},
+    "annovar":         {"threads": 2,  "mem_mb": 4000},
+    "small":           {"threads": 1,  "mem_mb": 2000},                 # flagstat, pileup, bgzip, query
+}
+
+def _merge_resources(defaults, overrides):
+    merged = {k: dict(v) for k, v in defaults.items()}
+    for k, v in (overrides or {}).items():
+        merged.setdefault(k, {}).update(v)
+    return merged
+
+RES = _merge_resources(DEFAULT_RESOURCES, config.get("resources"))
+
+# Extra JVM options for every Java call. Each JVM otherwise sizes its
+# garbage-collector thread pool from all 96 cores.
+JAVA_OPTS = config.get("java_opts", "-XX:ParallelGCThreads=2")
+
+# Optional scratch directory (ideally a local disk) for sort temp files.
+# Default: a TEMP folder inside each sample's results directory.
+TMP_ROOT = config.get("tmp_dir") or ""
+
+def tmp_dir(wildcards):
+    if TMP_ROOT:
+        return f"{TMP_ROOT}/{wildcards.sample_udi}"
+    return RESULTS + f"/{wildcards.sample_udi}/TEMP"
 ANNOVAR_annotate = config["tools"]["annovar_annotate"]
 ANNOVAR_humandb = config["tools"]["annovar_humandb"]
 
@@ -108,6 +162,19 @@ def filter_min_reads(wildcards):
     fs = FILTER_SETTINGS[wildcards.setting]
     return str(fs["sscs"]) if wildcards.layer == "SSCS" else str(fs["duplex"])
 
+# SSCS filtering only depends on the SSCS min-reads value, so settings that
+# share it (e.g. 3-2-1 and 2-1-1, both sscs: 1) give identical SSCS BAMs.
+# The first setting with each value is filtered/clipped; the others get a
+# symlink to its final BAM (see rule alias_duplicate_sscs).
+SSCS_CANONICAL = {}     # setting -> setting whose SSCS BAM it reuses
+_first_with_min = {}
+for _s in SETTINGS:
+    _m = str(FILTER_SETTINGS[_s]["sscs"])
+    if _m in _first_with_min:
+        SSCS_CANONICAL[_s] = _first_with_min[_m]
+    else:
+        _first_with_min[_m] = _s
+
 # ---------------------------------------------------------------------
 # Final targets
 # ---------------------------------------------------------------------
@@ -163,7 +230,9 @@ rule fastqc:
         done = touch(RESULTS + "/{sample_udi}/fastqc/{sample_udi}_fastqc.done"),
     params:
         outdir = RESULTS + "/{sample_udi}/fastqc",
-    threads: THREADS
+    threads: RES["fastqc"]["threads"]          # FastQC threads = files in parallel, so 2 is the max
+    resources:
+        mem_mb = RES["fastqc"]["mem_mb"],
     conda: "envs/fastqc.yaml"
     shell:
         """
@@ -188,12 +257,14 @@ rule fastq_to_bam:
     params:
         sample = get_sample_name,
         library = get_library_name,
-        java_xmx = JAVA_XMX,
-    threads: THREADS
+        java_xmx = RES["fastq_to_bam"]["xmx"],
+    threads: RES["fastq_to_bam"]["threads"]
+    resources:
+        mem_mb = RES["fastq_to_bam"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io FastqToBam \
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 1 --async-io FastqToBam \
             --input {input.fq1} {input.fq2} \
             --read-structures 3M2S+T 3M2S+T \
             --umi-tag RX \
@@ -210,58 +281,50 @@ rule fastq_to_bam:
 # overwrote RX with genomic bases 6-8 of each read.
 
 # ---------------------------------------------------------------------
-# Rule: BWA MEM alignment to reference
+# Rule: BWA MEM alignment, ZipperBams and template-coordinate sort (one stream)
 # ---------------------------------------------------------------------
+# fgbio best practice: everything is piped, so no intermediate FASTQs or
+# unsorted BAMs are written to disk.
+#   -p          interleaved pairs from samtools fastq
+#   -K 150000000 fixed batch size -> output identical whatever -t is
+#   -Y          soft-clip supplementary alignments (as for the consensus reads)
+# NOTE: -K/-Y were not used before, so alignments can differ very slightly
+# from runs made with the old align_and_merge rule.
 
-rule align_and_merge:
+rule align_zipper_sort:
     input:
         unmapped = unmapped_bam,
     output:
-        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged.bam",
+        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged_sorted.bam",
     log:
         RESULTS + "/{sample_udi}/logs/align_merge.log",
     params:
-        tmp_dir = RESULTS + "/{sample_udi}/TEMP",
-        java_xmx = JAVA_XMX,
-    threads: THREADS
+        tmp_dir = tmp_dir,
+        java_xmx = RES["align"]["xmx"],
+        bwa_threads = RES["align"]["bwa_threads"],
+        sort_threads = RES["align"]["sort_threads"],
+        sort_mem = RES["align"]["sort_mem"],
+    threads: RES["align"]["threads"]
+    resources:
+        mem_mb = RES["align"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
         mkdir -p {params.tmp_dir} $(dirname {log})
         (
-        samtools fastq -n \
-            -1 {params.tmp_dir}/r1.fq.gz \
-            -2 {params.tmp_dir}/r2.fq.gz \
-            {input.unmapped}
-
-        bwa mem -t {threads} {REF} \
-            {params.tmp_dir}/r1.fq.gz \
-            {params.tmp_dir}/r2.fq.gz \
-            | samtools view -b -o {params.tmp_dir}/aligned.bam
-
-        java -Xmx{params.java_xmx} -jar {FGBIO} --tmp-dir {params.tmp_dir} ZipperBams \
-        --unmapped {input.unmapped} \
-        --input {params.tmp_dir}/aligned.bam \
-        --output {output.bam} \
-        --ref {REF}
+        samtools fastq -n {input.unmapped} \
+            | bwa mem -t {params.bwa_threads} -p -K 150000000 -Y {REF} - \
+            | java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 0 --async-io \
+                --tmp-dir {params.tmp_dir} ZipperBams \
+                --unmapped {input.unmapped} \
+                --input /dev/stdin \
+                --ref {REF} \
+                --output /dev/stdout \
+            | samtools sort --template-coordinate \
+                -@ {params.sort_threads} -m {params.sort_mem} \
+                -T {params.tmp_dir}/{wildcards.sample_udi}_tc_sort \
+                -o {output.bam} -
         ) 2> {log}
-        """
-
-# ---------------------------------------------------------------------
-# Rule: Samtools sort merged BAM by coordinates for grouping
-# ---------------------------------------------------------------------
-
-rule sort_merged_bam:
-    input:
-        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged.bam",
-    output:
-        bam = RESULTS + "/{sample_udi}/{sample_udi}_mapped_merged_sorted.bam",
-    threads: THREADS
-    conda: "envs/fgbio.yaml"
-    shell:
-        """
-        samtools sort --template-coordinate -@ {threads} \
-            -o {output.bam} {input.bam}
         """
 
 # ---------------------------------------------------------------------
@@ -276,11 +339,16 @@ rule insert_size_metrics:
         histogram = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_insert_size_histogram.pdf",
     params:
         outdir = RESULTS + "/{sample_udi}/Metrics_and_images",
+        java_xmx = RES["insert_size"]["xmx"],
+    threads: RES["insert_size"]["threads"]
+    resources:
+        mem_mb = RES["insert_size"]["mem_mb"],
     conda: "envs/picard.yaml"
     shell:
         """
         mkdir -p {params.outdir}
-        java -jar {PICARD} CollectInsertSizeMetrics \
+        # explicit -Xmx: without it Java takes up to 1/4 of the server's RAM (~64 GB)
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {PICARD} CollectInsertSizeMetrics \
             I={input.bam} \
             O={output.metrics} \
             H={output.histogram}
@@ -298,14 +366,16 @@ rule group_reads_by_umi:
         family_histogram = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_family_size_histogram.txt",
         umi_metrics = RESULTS + "/{sample_udi}/Metrics_and_images/{sample_udi}_SSCS_UMI_metrics.txt",
     params:
-        java_xmx = JAVA_XMX,
+        java_xmx = RES["group"]["xmx"],
         outdir = RESULTS + "/{sample_udi}/Metrics_and_images",
-    threads: THREADS
+    threads: RES["group"]["threads"]
+    resources:
+        mem_mb = RES["group"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
         mkdir -p {params.outdir}
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io GroupReadsByUmi \
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 1 --async-io GroupReadsByUmi \
             --input {input.bam} \
             --strategy Paired \
             --edits 1 \
@@ -333,14 +403,16 @@ rule call_sscs_permissive:
     output:
         bam = RESULTS + PERM_DIR + "/{sample_udi}_SSCS_unmapped.bam",
     params:
-        java_xmx = JAVA_XMX,
+        java_xmx = RES["consensus"]["xmx"],
         min_reads = CALL_MIN_SSCS,
         base_qual_min = BASEQUALMIN,
-    threads: THREADS
+    threads: RES["consensus"]["threads"]
+    resources:
+        mem_mb = RES["consensus"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io CallMolecularConsensusReads \
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 1 --async-io CallMolecularConsensusReads \
             --input {input.bam} \
             --output {output.bam} \
             --min-reads {params.min_reads} \
@@ -358,14 +430,16 @@ rule call_dcs_permissive:
     output:
         bam = RESULTS + PERM_DIR + "/{sample_udi}_DCS_unmapped.bam",
     params:
-        java_xmx = JAVA_XMX,
+        java_xmx = RES["consensus"]["xmx"],
         min_reads = CALL_MIN_DUPLEX,
         base_qual_min = BASEQUALMIN,
-    threads: THREADS
+    threads: RES["consensus"]["threads"]
+    resources:
+        mem_mb = RES["consensus"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io CallDuplexConsensusReads \
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 1 --async-io CallDuplexConsensusReads \
             --input {input.bam} \
             --output {output.bam} \
             --min-reads {params.min_reads} \
@@ -383,14 +457,17 @@ rule map_merge_consensus:
     output:
         bam = RESULTS + PERM_DIR + "/{sample_udi}_{layer}_mapped.bam",
     params:
-        java_xmx = JAVA_XMX,
-    threads: THREADS
+        java_xmx = RES["map_consensus"]["xmx"],
+        bwa_threads = RES["map_consensus"]["bwa_threads"],
+    threads: RES["map_consensus"]["threads"]
+    resources:
+        mem_mb = RES["map_consensus"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
         samtools fastq {input.bam} \
-          | bwa mem -t {threads} -p -K 150000000 -Y {REF} - \
-          | java -Xmx{params.java_xmx} -jar {FGBIO} --compression 1 --async-io ZipperBams \
+          | bwa mem -t {params.bwa_threads} -p -K 150000000 -Y {REF} - \
+          | java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 1 --async-io ZipperBams \
               --unmapped {input.bam} \
               --ref {REF} \
               --tags-to-reverse Consensus \
@@ -405,84 +482,130 @@ rule map_merge_consensus:
 # ---------------------------------------------------------------------
 # Rule: FilterConsensusReads at this setting, then sort by name for ClipBam
 # ---------------------------------------------------------------------
+# The name-sorted filtered BAM is only an intermediate for ClipBam, so it
+# is marked temp() and deleted once the clipped/sorted BAM exists.
 
 rule filter_sort_consensus:
     input:
         bam = RESULTS + PERM_DIR + "/{sample_udi}_{layer}_mapped.bam",
     output:
-        bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered.bam",
+        bam = temp(RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered.bam"),
     params:
-        java_xmx = JAVA_XMX,
+        java_xmx = RES["filter"]["xmx"],
         min_reads = filter_min_reads,          # SSCS: "3" ; DCS: "6 3 3" (unquoted -> 3 args)
         cons_qual_min = CONSQUALMIN,
         max_base_error_rate = MAXBASEERRORRATE,
-    threads: THREADS
+        sort_threads = RES["filter"]["sort_threads"],
+        sort_mem = RES["filter"]["sort_mem"],
+        tmp_dir = tmp_dir,
+    threads: RES["filter"]["threads"]
+    resources:
+        mem_mb = RES["filter"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 FilterConsensusReads \
+        mkdir -p {params.tmp_dir}
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 0 FilterConsensusReads \
             --input {input.bam} \
             --output /dev/stdout \
             --ref {REF} \
             --min-reads {params.min_reads} \
             --min-base-quality {params.cons_qual_min} \
             --max-base-error-rate {params.max_base_error_rate} \
-            | samtools sort -n --threads {threads} -o {output.bam} -
+            | samtools sort -n -@ {params.sort_threads} -m {params.sort_mem} \
+                -T {params.tmp_dir}/{wildcards.setting}_{wildcards.layer}_nsort \
+                -o {output.bam} -
         """
 
 # ---------------------------------------------------------------------
-# Rule: Fgbio ClipBam
+# Rule: Fgbio ClipBam piped into coordinate sort + index
 # ---------------------------------------------------------------------
+# ClipBam is single-threaded; streaming it into samtools sort avoids writing
+# an uncompressed clipped BAM to disk. (Replaces the old clip_consensus +
+# sort_index_consensus pair; the final file names are unchanged.)
 
-rule clip_consensus:
+rule clip_sort_consensus:
     input:
         bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered.bam",
     output:
-        bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped.bam",
-        metrics = RESULTS + SET_DIR + "/Metrics/{sample_udi}_{layer}_overlap_metrics.txt",
-    params:
-        java_xmx = JAVA_XMX,
-        clip_bases = CLIPBASES,
-    threads: THREADS
-    conda: "envs/fgbio.yaml"
-    shell:
-        """
-        java -Xmx{params.java_xmx} -jar {FGBIO} --compression 0 ClipBam \
-        --input {input.bam} \
-        --output {output.bam} \
-        --ref {REF} \
-        --clipping-mode Hard \
-        --clip-overlapping-reads true \
-        --read-one-five-prime {params.clip_bases} \
-        --read-one-three-prime {params.clip_bases} \
-        --read-two-five-prime {params.clip_bases} \
-        --read-two-three-prime {params.clip_bases} \
-        --metrics {output.metrics}
-        """
-
-# ---------------------------------------------------------------------
-# Rule: Samtools sort + index; flagstat for a quick read-count comparison
-# ---------------------------------------------------------------------
-
-rule sort_index_consensus:
-    input:
-        bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped.bam",
-    output:
         bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam",
         bai = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam.bai",
-    threads: THREADS
+        metrics = RESULTS + SET_DIR + "/Metrics/{sample_udi}_{layer}_overlap_metrics.txt",
+    params:
+        java_xmx = RES["clip"]["xmx"],
+        clip_bases = CLIPBASES,
+        sort_threads = RES["clip"]["sort_threads"],
+        sort_mem = RES["clip"]["sort_mem"],
+        tmp_dir = tmp_dir,
+    threads: RES["clip"]["threads"]
+    resources:
+        mem_mb = RES["clip"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """
-        samtools sort -@ {threads} -o {output.bam} {input.bam}
-        samtools index {output.bam}
+        mkdir -p {params.tmp_dir} $(dirname {output.metrics})
+        java -Xmx{params.java_xmx} {JAVA_OPTS} -jar {FGBIO} --compression 0 ClipBam \
+            --input {input.bam} \
+            --output /dev/stdout \
+            --ref {REF} \
+            --clipping-mode Hard \
+            --clip-overlapping-reads true \
+            --read-one-five-prime {params.clip_bases} \
+            --read-one-three-prime {params.clip_bases} \
+            --read-two-five-prime {params.clip_bases} \
+            --read-two-three-prime {params.clip_bases} \
+            --metrics {output.metrics} \
+            | samtools sort -@ {params.sort_threads} -m {params.sort_mem} \
+                -T {params.tmp_dir}/{wildcards.setting}_{wildcards.layer}_csort \
+                -o {output.bam} -
+        samtools index -@ {params.sort_threads} {output.bam}
         """
+
+# ---------------------------------------------------------------------
+# Rule: reuse the SSCS BAM of an earlier setting with the same SSCS min-reads
+# ---------------------------------------------------------------------
+# e.g. 2-1-1 SSCS -> symlink to 3-2-1 SSCS. Only defined when such
+# duplicates exist. Variant calling etc. still run per setting as before.
+
+if SSCS_CANONICAL:
+    import re as _re
+
+    rule alias_duplicate_sscs:
+        input:
+            bam = lambda w: RESULTS + f"/{w.sample_udi}/{SSCS_CANONICAL[w.setting]}/SSCS/{w.sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam",
+            bai = lambda w: RESULTS + f"/{w.sample_udi}/{SSCS_CANONICAL[w.setting]}/SSCS/{w.sample_udi}_SSCS_mapped_filtered_clipped_sorted.bam.bai",
+        output:
+            bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam",
+            bai = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam.bai",
+        wildcard_constraints:
+            setting = "|".join(_re.escape(s) for s in SSCS_CANONICAL),
+            layer = "SSCS",
+        params:
+            canon = lambda w: SSCS_CANONICAL[w.setting],
+        threads: 1
+        resources:
+            mem_mb = 100,
+        shell:
+            """
+            mkdir -p $(dirname {output.bam})
+            ln -sfn ../../{params.canon}/SSCS/$(basename {output.bam}) {output.bam}
+            ln -sfn ../../{params.canon}/SSCS/$(basename {output.bai}) {output.bai}
+            """
+
+    ruleorder: alias_duplicate_sscs > clip_sort_consensus
+
+# ---------------------------------------------------------------------
+# Rule: flagstat for a quick read-count comparison
+# ---------------------------------------------------------------------
 
 rule flagstat_consensus:
     input:
         bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam",
     output:
         txt = RESULTS + SET_DIR + "/Metrics/{sample_udi}_{layer}_flagstat.txt",
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         "samtools flagstat {input.bam} > {output.txt}"
@@ -500,11 +623,16 @@ rule call_variants:
         outdir = RESULTS + SET_DIR + "/Variants",
         bed = SNV_BED,
         allfreq = ALLFREQ,
-    threads: THREADS
+        java_xmx = RES["vardict"]["xmx"],
+    threads: RES["vardict"]["threads"]
+    resources:
+        mem_mb = RES["vardict"]["mem_mb"],
     conda: "envs/vardict.yaml"
     shell:
         """
         mkdir -p {params.outdir}
+        # vardict-java's launcher reads JAVA_OPTS (explicit heap instead of the JVM default)
+        export JAVA_OPTS="-Xmx{params.java_xmx} {JAVA_OPTS}"
         vardict-java \
             -G {REF} \
             -N {wildcards.sample_udi} \
@@ -538,7 +666,11 @@ rule annotate_variants:
         annovar_annotate = ANNOVAR_annotate,
         annovar_humandb = ANNOVAR_humandb,
         out_prefix = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_variants_annotated",
-    threads: THREADS
+    threads: RES["annovar"]["threads"]
+    resources:
+        mem_mb = RES["annovar"]["mem_mb"],
+        annovar = 1,     # cap concurrent ANNOVAR jobs (all read the same databases) with
+                         # --resources annovar=4 on the command line
     shell:
         """
         perl {params.annovar_annotate} {input.vcf} {params.annovar_humandb}/ \
@@ -558,6 +690,9 @@ rule compress_index_annotated_vcf:
     output:
         annotated_vcf_gz = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_variants_annotated.hg38_multianno.vcf.gz",
         annotated_vcf_gz_tbi = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_variants_annotated.hg38_multianno.vcf.gz.tbi",
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
     conda: "envs/bcftools.yaml"
     shell:
         """
@@ -570,6 +705,9 @@ rule create_annotated_tsv:
         annotated_vcf_gz = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_variants_annotated.hg38_multianno.vcf.gz",
     output:
         tsv = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_variants_annotated.tsv",
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
     conda: "envs/bcftools.yaml"
     shell:
         """
@@ -590,6 +728,9 @@ rule create_pileup:
         pileup = RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_pileup.txt",
     params:
         snv_bed = SNV_BED,
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
     conda: "envs/fgbio.yaml"
     shell:
         """

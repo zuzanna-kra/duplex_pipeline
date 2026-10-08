@@ -3,7 +3,11 @@
 # =====================================================================
 # Edit the paths below for your environment, then run:
 #
-#   snakemake --use-conda --conda-frontend conda --cores 16
+#   snakemake --use-conda --conda-frontend conda \
+#       --cores 80 --resources mem_mb=190000 annovar=4
+#
+# If several runs share the server at once, split the budget between them,
+# e.g. two runs with --cores 40 --resources mem_mb=95000 annovar=2 each.
 #
 # =====================================================================
 
@@ -44,8 +48,20 @@ tools:
   annovar_humandb:  "/path/to/annovar/humandb"            # <-- CHANGE THIS
 
 # --- Resources ---
-threads: 16       # default threads per rule
-java_xmx: "32G"  # Java heap size for fgbio / picard
+# Per-rule threads / RAM defaults live in workflow/Snakefile (DEFAULT_RESOURCES),
+# sized for RADT-OUILLE (<=80 threads, <200 GB RAM at once; bwa <=32 threads,
+# samtools/fgbio/Picard <=24). Override any of them here, e.g.:
+#
+# resources:
+#   align:     {threads: 34, bwa_threads: 32}
+#   consensus: {threads: 24, xmx: "24G", mem_mb: 30000}
+#
+# Extra JVM options added to every Java call (GC threads otherwise scale to 96 cores):
+# java_opts: "-XX:ParallelGCThreads=2"
+#
+# Scratch directory for sort/fgbio temp files (a local disk if available).
+# Default: {results_dir}/{sample_udi}/TEMP
+# tmp_dir: "/tmp/zuzanna_duplex"
 
 # --- Duplex consensus calling parameters ---
 # Consensus is CALLED ONCE permissively, then FILTERED at each setting below
