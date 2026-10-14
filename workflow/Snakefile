@@ -50,6 +50,7 @@ DEFAULT_RESOURCES = {
     "vardict":         {"threads": 4,  "mem_mb": 10000, "xmx": "8G"},
     "annovar":         {"threads": 2,  "mem_mb": 4000},
     "small":           {"threads": 1,  "mem_mb": 2000},                 # flagstat, pileup, bgzip, query
+    "duplexcaller":    {"threads": 1,  "mem_mb": 4000},                 # single-threaded Python
 }
 
 def _merge_resources(defaults, overrides):
@@ -74,6 +75,16 @@ def tmp_dir(wildcards):
     return RESULTS + f"/{wildcards.sample_udi}/TEMP"
 ANNOVAR_annotate = config["tools"]["annovar_annotate"]
 ANNOVAR_humandb = config["tools"]["annovar_humandb"]
+# Same databases for the VarDict and duplexcaller annotation rules
+ANNOVAR_PROTOCOL  = "refGene,cosmic102_coding,cosmic101_noncoding,exac03,gnomad_genome,clinvar_20240917"
+ANNOVAR_OPERATION = "g,f,f,f,f,f"
+
+# Custom duplex caller (github.com/zuzanna-kra/variant_caller). Run from its
+# source folder (PYTHONPATH), so no install is needed; see config `duplexcaller`.
+DC = config.get("duplexcaller") or {}
+DC_ENABLED = bool(DC.get("enabled", False))
+DC_SRC = DC.get("src", "")
+DC_PARAMS = DC.get("params") or ""
 
 CALL_MIN_SSCS    = config["consensus"]["call_min_reads_sscs"]     # permissive, e.g. 1
 CALL_MIN_DUPLEX  = config["consensus"]["call_min_reads_duplex"]   # permissive, e.g. "1 1 0"
@@ -104,6 +115,7 @@ EXISTING_UNMAPPED = config.get("existing_unmapped_bam") or ""
 # filtered per setting:                  {sample_udi}/{setting}/{SSCS,DCS,Variants,Metrics}/
 PERM_DIR = "/{sample_udi}/consensus_permissive"
 SET_DIR  = "/{sample_udi}/{setting}"
+DC_DIR   = SET_DIR + "/DuplexCaller"    # custom duplex caller outputs
 
 wildcard_constraints:
     sample_udi = "[^/]+",
@@ -198,6 +210,10 @@ SWEEP_OUTPUTS = [
     expand(RESULTS + SET_DIR + "/Variants/{sample_udi}_{layer}_pileup.txt",
            sample_udi=SAMPLES, setting=SETTINGS, layer=LAYERS),
 ]
+if DC_ENABLED:
+    SWEEP_OUTPUTS.append(
+        expand(RESULTS + DC_DIR + "/{sample_udi}_{layer}.final.tsv",
+               sample_udi=SAMPLES, setting=SETTINGS, layer=LAYERS))
 
 # When starting from existing grouped BAMs, don't ask for FASTQ-level outputs.
 if EXISTING_GROUPED:
@@ -678,8 +694,8 @@ rule annotate_variants:
             -vcfinput \
             -out {params.out_prefix} \
             -remove \
-            -protocol refGene,cosmic102_coding,cosmic101_noncoding,exac03,gnomad_genome,clinvar_20240917 \
-            -operation g,f,f,f,f,f \
+            -protocol {ANNOVAR_PROTOCOL} \
+            -operation {ANNOVAR_OPERATION} \
             -nastring . \
             -thread {threads}
         """
@@ -745,4 +761,93 @@ rule create_pileup:
             -l "{params.snv_bed}" \
             {input.bam} \
             > {output.pileup}
+        """
+
+
+# ---------------------------------------------------------------------
+# Custom duplex caller: count every allele -> ANNOVAR -> final table
+# ---------------------------------------------------------------------
+# Outputs in {setting}/DuplexCaller/ (see `duplexcaller schema` for columns):
+#   .alleles.tsv     every non-reference base with its evidence (no filtering)
+#   .depth.tsv.gz    every panel position: counts per base + exclusions by reason
+#   .reads.tsv.gz    one row per alt-supporting read
+#   .vcf.gz          the allele table as VCF, input to ANNOVAR
+#   .run.yaml        version, commit, parameters, run summary
+#   .final.tsv       alleles + gene, protein/cDNA change and all ANNOVAR fields
+
+rule duplexcaller_pileup:
+    input:
+        bam = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam",
+        bai = RESULTS + SET_DIR + "/{layer}/{sample_udi}_{layer}_mapped_filtered_clipped_sorted.bam.bai",
+    output:
+        alleles = RESULTS + DC_DIR + "/{sample_udi}_{layer}.alleles.tsv",
+        depth = RESULTS + DC_DIR + "/{sample_udi}_{layer}.depth.tsv.gz",
+        reads = RESULTS + DC_DIR + "/{sample_udi}_{layer}.reads.tsv.gz",
+        vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.vcf.gz",
+        tbi = RESULTS + DC_DIR + "/{sample_udi}_{layer}.vcf.gz.tbi",
+        run = RESULTS + DC_DIR + "/{sample_udi}_{layer}.run.yaml",
+    params:
+        src = DC_SRC,
+        prefix = RESULTS + DC_DIR + "/{sample_udi}_{layer}",
+        bed = SNV_BED,
+        params_opt = f"--params {DC_PARAMS}" if DC_PARAMS else "",
+    threads: RES["duplexcaller"]["threads"]
+    resources:
+        mem_mb = RES["duplexcaller"]["mem_mb"],
+    conda: "envs/duplexcaller.yaml"
+    shell:
+        """
+        PYTHONPATH={params.src} python -m duplexcaller pileup \
+            --bam {input.bam} \
+            --bed {params.bed} \
+            --ref {REF} \
+            --sample {wildcards.sample_udi} \
+            --out-prefix {params.prefix} \
+            {params.params_opt}
+        """
+
+rule annotate_duplexcaller:
+    input:
+        vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.vcf.gz",
+    output:
+        multianno_vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf",
+    params:
+        annovar_annotate = ANNOVAR_annotate,
+        annovar_humandb = ANNOVAR_humandb,
+        out_prefix = RESULTS + DC_DIR + "/{sample_udi}_{layer}",
+    threads: RES["annovar"]["threads"]
+    resources:
+        mem_mb = RES["annovar"]["mem_mb"],
+        annovar = 1,
+    shell:
+        """
+        perl {params.annovar_annotate} {input.vcf} {params.annovar_humandb}/ \
+            -buildver hg38 \
+            -vcfinput \
+            -out {params.out_prefix} \
+            -remove \
+            -protocol {ANNOVAR_PROTOCOL} \
+            -operation {ANNOVAR_OPERATION} \
+            -nastring . \
+            -thread {threads}
+        """
+
+rule merge_duplexcaller_annovar:
+    input:
+        alleles = RESULTS + DC_DIR + "/{sample_udi}_{layer}.alleles.tsv",
+        annovar_vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf",
+    output:
+        final = RESULTS + DC_DIR + "/{sample_udi}_{layer}.final.tsv",
+    params:
+        src = DC_SRC,
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
+    conda: "envs/duplexcaller.yaml"
+    shell:
+        """
+        PYTHONPATH={params.src} python -m duplexcaller merge-annovar \
+            --alleles {input.alleles} \
+            --annovar-vcf {input.annovar_vcf} \
+            --out {output.final}
         """

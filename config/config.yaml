@@ -89,3 +89,13 @@ existing_grouped_bam: ""
 variants:
   map_qual: 23
   all_freq: "0.000001"     # minimum allele frequency to report
+
+# --- Custom duplex caller (duplexcaller) ---
+# Runs alongside VarDict; results in {setting}/DuplexCaller/. Reports every
+# allele with its evidence (no filtering), then annotates it with ANNOVAR
+# (same databases as the VarDict rule) into {sample}_{layer}.final.tsv.
+duplexcaller:
+  enabled: false
+  src: "/path/to/variant_caller/src"   # <-- CHANGE THIS (clone of github.com/zuzanna-kra/variant_caller)
+  params: ""                           # optional YAML of caller parameters ("" = defaults;
+                                       # print them with: PYTHONPATH=<src> python -m duplexcaller params)
