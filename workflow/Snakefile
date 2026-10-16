@@ -212,8 +212,9 @@ SWEEP_OUTPUTS = [
 ]
 if DC_ENABLED:
     SWEEP_OUTPUTS.append(
-        expand(RESULTS + DC_DIR + "/{sample_udi}_{layer}.final.tsv",
-               sample_udi=SAMPLES, setting=SETTINGS, layer=LAYERS))
+        expand(RESULTS + DC_DIR + "/{sample_udi}_{layer}.{ext}",
+               sample_udi=SAMPLES, setting=SETTINGS, layer=LAYERS,
+               ext=["final.tsv", "hg38_multianno.vcf.gz"]))
 
 # When starting from existing grouped BAMs, don't ask for FASTQ-level outputs.
 if EXISTING_GROUPED:
@@ -773,6 +774,7 @@ rule create_pileup:
 #   .reads.tsv.gz    one row per alt-supporting read
 #   .vcf.gz          the allele table as VCF, input to ANNOVAR
 #   .run.yaml        version, commit, parameters, run summary
+#   .hg38_multianno.vcf.gz  ANNOVAR-annotated VCF (bgzip + tabix, as for VarDict)
 #   .final.tsv       alleles + gene, protein/cDNA change and all ANNOVAR fields
 
 rule duplexcaller_pileup:
@@ -830,6 +832,22 @@ rule annotate_duplexcaller:
             -operation {ANNOVAR_OPERATION} \
             -nastring . \
             -thread {threads}
+        """
+
+rule compress_index_duplexcaller_annotated_vcf:
+    input:
+        vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf",
+    output:
+        vcf_gz = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf.gz",
+        tbi = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf.gz.tbi",
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
+    conda: "envs/bcftools.yaml"
+    shell:
+        """
+        bgzip -c {input.vcf} > {output.vcf_gz}
+        tabix -p vcf {output.vcf_gz}
         """
 
 rule merge_duplexcaller_annovar:
