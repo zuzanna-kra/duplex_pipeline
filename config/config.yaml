@@ -71,7 +71,7 @@ consensus:
   call_min_reads_duplex: "1 1 0"  # CallDuplexConsensusReads --min-reads (total, AB, BA)
   base_qual_min: 20               # min input base quality
   cons_qual_min: 45               # min consensus base quality (filter step)
-  max_base_error_rate: 0.2        # max per-base error rate (filter step)
+  max_base_error_rate: 0.1        # max per-base error rate (filter step); 0.1 as supervisor's pipeline / NanoSeq -f 0.9 (changed from 0.2, 19 Oct 2026)
   clip_bases: 3                   # bases to hard-clip from each read end
 
 # --- Filter settings to compare (FilterConsensusReads --min-reads) ---
