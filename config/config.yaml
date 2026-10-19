@@ -99,3 +99,5 @@ duplexcaller:
   src: "/path/to/variant_caller/src"   # <-- CHANGE THIS (clone of github.com/zuzanna-kra/variant_caller)
   params: ""                           # optional YAML of caller parameters ("" = defaults;
                                        # print them with: PYTHONPATH=<src> python -m duplexcaller params)
+  filters: ""                          # optional filter rules YAML ("" = built-in default; print it with:
+                                       # PYTHONPATH=<src> python -m duplexcaller filter --show-default)

@@ -162,6 +162,7 @@ duplexcaller:
   enabled: true
   src: "/path/to/variant_caller/src"   # the clone's src/ folder
   params: ""                           # optional YAML of caller parameters ("" = defaults)
+  filters: ""                          # optional filter rules YAML ("" = built-in rules)
 ```
 
 Default caller parameters (print with `PYTHONPATH=<src> python -m duplexcaller params`):
@@ -176,6 +177,7 @@ QC-fail, duplicate, supplementary); AS−XS alert below 50.
 | `annotate_duplexcaller` | ANNOVAR (`table_annovar.pl -vcfinput`, same databases as the VarDict rule) on the caller's VCF |
 | `compress_index_duplexcaller_annotated_vcf` | bgzip + tabix of the annotated VCF |
 | `merge_duplexcaller_annovar` | Joins ANNOVAR's annotation onto the allele table → `final.tsv` |
+| `filter_duplexcaller` | Flags every allele with the filter rules → `flagged.tsv`, `pass.tsv`, `flagged.vcf.gz` (never edits `final.tsv`) |
 
 Single-threaded, ~4 GB per job; ~3 min per DCS file on the Horizon panel, longer for SSCS.
 
@@ -183,7 +185,11 @@ Single-threaded, ~4 GB per job; ~3 min per DCS file on the Horizon panel, longer
 
 | File | Content |
 |---|---|
-| `{sample_udi}_{layer}.final.tsv` | **Main output.** Every allele + evidence + alert labels + gene, protein/cDNA change, consequence, gnomAD, ClinVar, COSMIC |
+| `{sample_udi}_{layer}.final.tsv` | **Main output, pre-filter.** Every allele + evidence + alert labels + gene, protein/cDNA change, consequence, gnomAD, ClinVar, COSMIC |
+| `{sample_udi}_{layer}.flagged.tsv` | `final.tsv` + `flt_<rule>` columns + `FILTER` (all rows kept) |
+| `{sample_udi}_{layer}.pass.tsv` | **Post-filter.** Rows of `flagged.tsv` with `FILTER == PASS` |
+| `{sample_udi}_{layer}.filter_summary.tsv` / `.filter.yaml` | Alleles failing each rule / rules and versions used |
+| `{sample_udi}_{layer}.flagged.vcf.gz` (+ `.tbi`) | Annotated VCF with FILTER set by the rules |
 | `{sample_udi}_{layer}.alleles.tsv` | Every allele with its evidence (before annotation) |
 | `{sample_udi}_{layer}.depth.tsv.gz` | Every panel position: fragment counts per base and every exclusion by reason |
 | `{sample_udi}_{layer}.reads.tsv.gz` | One row per read supporting a non-reference base |
@@ -192,13 +198,21 @@ Single-threaded, ~4 GB per job; ~3 min per DCS file on the Horizon panel, longer
 | `{sample_udi}_{layer}.hg38_multianno.txt` | ANNOVAR table |
 | `{sample_udi}_{layer}.run.yaml` | Caller version, git commit, command, parameters, run summary |
 
+### Filter rules
+
+`filter_duplexcaller` uses `duplexcaller.filters` (a YAML file) or the caller's built-in
+rules (`PYTHONPATH=<src> python -m duplexcaller filter --show-default`). To try other
+thresholds, copy that output to a file, edit it, set `filters:` to its path and re-run:
+only `filter_duplexcaller` re-runs, because the rules file is one of its inputs.
+`final.tsv` is never touched, so pre- and post-filter tables always coexist.
+
 ### Run only the custom caller
 
 ```bash
 snakemake -s workflow/Snakefile \
     --configfile config/config.local.yaml config/config_horizon_umifix.yaml \
     --use-conda --conda-frontend conda --rerun-triggers mtime \
-    --until merge_duplexcaller_annovar compress_index_duplexcaller_annotated_vcf \
+    --until filter_duplexcaller \
     --cores 40 --resources mem_mb=150000 annovar=4
 ```
 

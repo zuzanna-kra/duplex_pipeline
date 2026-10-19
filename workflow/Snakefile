@@ -85,6 +85,7 @@ DC = config.get("duplexcaller") or {}
 DC_ENABLED = bool(DC.get("enabled", False))
 DC_SRC = DC.get("src", "")
 DC_PARAMS = DC.get("params") or ""
+DC_FILTERS = DC.get("filters") or ""    # filter rules YAML ("" = the caller's built-in default)
 
 CALL_MIN_SSCS    = config["consensus"]["call_min_reads_sscs"]     # permissive, e.g. 1
 CALL_MIN_DUPLEX  = config["consensus"]["call_min_reads_duplex"]   # permissive, e.g. "1 1 0"
@@ -214,7 +215,7 @@ if DC_ENABLED:
     SWEEP_OUTPUTS.append(
         expand(RESULTS + DC_DIR + "/{sample_udi}_{layer}.{ext}",
                sample_udi=SAMPLES, setting=SETTINGS, layer=LAYERS,
-               ext=["final.tsv", "hg38_multianno.vcf.gz"]))
+               ext=["final.tsv", "hg38_multianno.vcf.gz", "flagged.tsv", "pass.tsv", "flagged.vcf.gz"]))
 
 # When starting from existing grouped BAMs, don't ask for FASTQ-level outputs.
 if EXISTING_GROUPED:
@@ -775,7 +776,11 @@ rule create_pileup:
 #   .vcf.gz          the allele table as VCF, input to ANNOVAR
 #   .run.yaml        version, commit, parameters, run summary
 #   .hg38_multianno.vcf.gz  ANNOVAR-annotated VCF (bgzip + tabix, as for VarDict)
-#   .final.tsv       alleles + gene, protein/cDNA change and all ANNOVAR fields
+#   .final.tsv       alleles + gene, protein/cDNA change and all ANNOVAR fields  (PRE-FILTER)
+#   .flagged.tsv     final.tsv + one flt_<rule> column per filter + FILTER (all rows kept)
+#   .pass.tsv        rows of .flagged.tsv with FILTER == PASS                  (POST-FILTER)
+#   .filter_summary.tsv / .filter.yaml   per-rule counts / rules used (provenance)
+#   .flagged.vcf.gz  annotated VCF with FILTER set from the rules (bgzip + tabix)
 
 rule duplexcaller_pileup:
     input:
@@ -868,4 +873,37 @@ rule merge_duplexcaller_annovar:
             --alleles {input.alleles} \
             --annovar-vcf {input.annovar_vcf} \
             --out {output.final}
+        """
+
+rule filter_duplexcaller:
+    # Flag-only: final.tsv is never changed, so pre- and post-filter outputs coexist.
+    # Rules: config duplexcaller.filters (YAML) or the caller's built-in default
+    # (print it with: PYTHONPATH=<src> python -m duplexcaller filter --show-default).
+    input:
+        final = RESULTS + DC_DIR + "/{sample_udi}_{layer}.final.tsv",
+        vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf.gz",
+        tbi = RESULTS + DC_DIR + "/{sample_udi}_{layer}.hg38_multianno.vcf.gz.tbi",
+        rules = DC_FILTERS or [],     # re-run when the rules file changes
+    output:
+        flagged = RESULTS + DC_DIR + "/{sample_udi}_{layer}.flagged.tsv",
+        passed = RESULTS + DC_DIR + "/{sample_udi}_{layer}.pass.tsv",
+        summary = RESULTS + DC_DIR + "/{sample_udi}_{layer}.filter_summary.tsv",
+        prov = RESULTS + DC_DIR + "/{sample_udi}_{layer}.filter.yaml",
+        vcf = RESULTS + DC_DIR + "/{sample_udi}_{layer}.flagged.vcf.gz",
+        tbi = RESULTS + DC_DIR + "/{sample_udi}_{layer}.flagged.vcf.gz.tbi",
+    params:
+        src = DC_SRC,
+        prefix = RESULTS + DC_DIR + "/{sample_udi}_{layer}",
+        config_opt = f"--config {DC_FILTERS}" if DC_FILTERS else "",
+    threads: RES["small"]["threads"]
+    resources:
+        mem_mb = RES["small"]["mem_mb"],
+    conda: "envs/duplexcaller.yaml"
+    shell:
+        """
+        PYTHONPATH={params.src} python -m duplexcaller filter \
+            --input {input.final} \
+            --vcf {input.vcf} \
+            --out-prefix {params.prefix} \
+            {params.config_opt}
         """
