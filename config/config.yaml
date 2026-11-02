@@ -23,9 +23,18 @@ run_name: "my_run"
 
 # --- Reference genome ---
 # Must have .fai, .dict, and BWA index files alongside it.
-# hg38 recommended. Build indices with: bwa index hg38.fa && samtools faidx hg38.fa
+# Use the GIAB GRCh38 analysis set with the GRC false duplications masked
+# (same chr names and coordinates as UCSC hg38, so BEDs and ANNOVAR hg38 work):
+#   https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/
+#   GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta.gz
+# Build indices with: samtools faidx ref.fasta && samtools dict ref.fasta > ref.dict && bwa index ref.fasta
+# Do NOT use plain UCSC hg38.fa: its false duplication of the U2AF1 region on
+# chr21 gives most U2AF1 reads MAPQ 0, so they are lost before consensus calling
+# (Horizon test, Oct 2026: ~80% of U2AF1 reads lost; Miller et al. 2022, J Mol Diagn).
+# The KMT2C decoy in this reference lowers depth at KMT2C exons 7-8 (reads from a
+# paralog now go to the decoy) - expected, and removes paralog false positives.
 reference:
-  fasta: "/path/to/hg38.fa"                        # <-- CHANGE THIS
+  fasta: "/path/to/GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta"   # <-- CHANGE THIS
 
 # --- Panel / target regions ---
 # BED file defining the genomic regions to call variants in.

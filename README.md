@@ -47,7 +47,8 @@ on the next run.
 - Conda (or Mamba)
 - Snakemake ≥ 7.8 (tested with 8.30): `conda create -n snakemake -c conda-forge -c bioconda snakemake`
 - ANNOVAR, installed manually (see [ANNOVAR setup](#annovar-setup))
-- hg38 reference with BWA index, `.fai` and `.dict`
+- GRCh38 reference with BWA index, `.fai` and `.dict`: the GIAB analysis set with
+  false duplications masked, not plain UCSC `hg38.fa` (see [Reference genome](#reference-genome))
 - For the custom caller: a clone of the caller repository
   ```bash
   git clone https://github.com/zuzanna-kra/variant_caller.git
@@ -93,7 +94,7 @@ Key settings:
 | Key | Meaning |
 |---|---|
 | `results_dir` | Output folder (keep outside the repo) |
-| `reference.fasta` | hg38 FASTA |
+| `reference.fasta` | GRCh38 FASTA (GIAB masked analysis set, see [Reference genome](#reference-genome)) |
 | `snv_bed` | Panel BED (regions for calling and mpileup) |
 | `tools.fgbio_jar`, `tools.picard_jar` | Jar paths (find them with `find .snakemake/conda -name "fgbio.jar"` after a first `--use-conda` run) |
 | `tools.annovar_annotate`, `tools.annovar_humandb` | ANNOVAR `table_annovar.pl` and `humandb/` |
@@ -102,6 +103,28 @@ Key settings:
 | `existing_unmapped_bam` / `existing_grouped_bam` | Start from existing BAMs instead of FASTQs (pattern with `{sample_udi}`, `{sample}`) |
 | `resources` | Override per-rule threads / RAM (defaults in `DEFAULT_RESOURCES`, `workflow/Snakefile`) |
 | `duplexcaller.*` | Custom caller, see below |
+
+### Reference genome
+
+Use `GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.fasta`
+from the [GIAB FTP](https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/references/GRCh38/).
+
+```bash
+gunzip GRCh38_GIABv3_*.fasta.gz
+samtools faidx GRCh38_GIABv3_*.fasta
+samtools dict GRCh38_GIABv3_*.fasta > GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18.dict
+bwa index GRCh38_GIABv3_*.fasta     # ~45 min
+```
+
+Why: plain UCSC `hg38.fa` contains a false duplication of the U2AF1 region on
+chr21 (Miller et al. 2022, *J Mol Diagn*). bwa cannot place U2AF1 reads uniquely,
+gives them MAPQ 0, and GroupReadsByUmi/VarDict drop them. On the Horizon standard
+(Oct 2026) ~80% of U2AF1 reads were lost (exon 8: 31 of 288k reads kept); with the
+masked reference >99.9% have MAPQ >= 1. Coordinates and chr names are unchanged,
+so panel BEDs and ANNOVAR `hg38` annotation still apply. Expected side effect:
+KMT2C exons 7-8 have lower depth, because reads from a KMT2C paralog now map to
+the KMT2C decoy instead of piling onto KMT2C. The Snakefile checks the index files
+at start-up and warns if the reference has alt contigs (i.e. looks like UCSC hg38).
 
 ### 5. Run
 

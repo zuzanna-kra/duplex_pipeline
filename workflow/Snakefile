@@ -12,6 +12,36 @@ configfile: "config/config.yaml"
 
 RESULTS  = config["results_dir"]
 REF      = config["reference"]["fasta"]
+
+# Reference sanity check (runs at parse time, also for dry runs).
+# Use the GIAB GRCh38 analysis set with GRC false duplications masked
+# (GRCh38_GIABv3_no_alt_analysis_set_maskedGRC_decoys_MAP2K3_KMT2C_KCNJ18).
+# Plain UCSC hg38.fa contains a false duplication of the U2AF1 region on
+# chr21: ~80% of U2AF1 reads get MAPQ 0 and are dropped by GroupReadsByUmi
+# and VarDict (Miller et al. 2022, J Mol Diagn). It also contains alt
+# contigs, which give MAPQ 0 elsewhere because bwa is not run alt-aware.
+def _check_reference(ref):
+    import sys
+    if not Path(ref).exists():     # e.g. a dry run on a laptop: warn, don't stop
+        print(f"WARNING: reference {ref} not found", file=sys.stderr)
+        return
+    missing = [ext for ext in (".fai", ".amb", ".ann", ".bwt", ".pac", ".sa")
+               if not Path(ref + ext).exists()]
+    if not (Path(ref).with_suffix(".dict").exists() or Path(ref + ".dict").exists()):
+        missing.append(".dict")
+    if missing:
+        raise ValueError(f"Reference {ref} is missing index files: {', '.join(missing)} "
+                         "(bwa index, samtools faidx, samtools dict)")
+    with open(ref + ".fai") as fai:
+        alts = [line.split("\t", 1)[0] for line in fai
+                if line.split("\t", 1)[0].endswith("_alt")]
+    if alts:
+        print(f"WARNING: reference {ref} contains {len(alts)} alt contigs - it looks like "
+              "plain UCSC hg38, which loses most U2AF1 reads (MAPQ 0). Use the GIAB "
+              "masked analysis set instead (see config/config.yaml).", file=sys.stderr)
+
+_check_reference(REF)
+
 SNV_BED     = config["snv_bed"]
 
 FGBIO = config["tools"]["fgbio_jar"]
