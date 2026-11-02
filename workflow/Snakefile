@@ -168,6 +168,20 @@ samples_df = (
 SAMPLES = samples_df["sample_udi"].tolist()
 
 # ---------------------------------------------------------------------
+# Remove the per-sample TEMP folders once the WHOLE run has succeeded
+# ---------------------------------------------------------------------
+# TEMP only holds scratch files (samtools sort chunks, fgbio tmp); no rule
+# output lives there. After a failed run it is kept for debugging.
+# Snakemake does not run onsuccess for dry runs (-n).
+onsuccess:
+    import shutil
+    for _s in SAMPLES:
+        _t = Path(f"{TMP_ROOT}/{_s}" if TMP_ROOT else RESULTS + f"/{_s}/TEMP")
+        if _t.is_dir():
+            shutil.rmtree(_t, ignore_errors=True)
+            print(f"Removed {_t}")
+
+# ---------------------------------------------------------------------
 # Helper functions for accessing per-sample metadata inside rules
 # ---------------------------------------------------------------------
 # These are "input functions" — Snakemake calls them with a `wildcards`

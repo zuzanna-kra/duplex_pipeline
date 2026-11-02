@@ -70,6 +70,7 @@ tools:
 #
 # Scratch directory for sort/fgbio temp files (a local disk if available).
 # Default: {results_dir}/{sample_udi}/TEMP
+# These folders are deleted automatically when the whole run succeeds (kept after a failure).
 # tmp_dir: "/tmp/zuzanna_duplex"
 
 # --- Duplex consensus calling parameters ---
